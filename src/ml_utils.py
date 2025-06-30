@@ -23,12 +23,12 @@ def evalua_modelo_ST_por_ventana(
     metric: str = "rmse",
 ):
     """
-    Utiliza una ventana móvil o recursiva para evaluar un modelo ETS, promedio_movil o prophet en un periodo de prueba específico.
+    Utiliza una ventana móvil o recursiva para evaluar un modelo ETS, promedio_movil, ARIMA o prophet en un periodo de prueba específico.
     Esta función solo es valida si la data es mensual, ya que se basa en el tamaño de la ventana en meses.
 
     Parámetros:
     - index_name: Nombre del índice de la serie temporal (ej. 'fecha').
-    - model_type: Tipo de modelo a evaluar ('ETS','MA','RLM', 'prophet').
+    - model_type: Tipo de modelo a evaluar ('ETS','MA','ARIMA', 'prophet').
     - init_params: Parámetros iniciales del modelo.
     - fit_params: Parámetros de ajuste del modelo.
     - data: DataFrame con la serie temporal a evaluar.
@@ -73,12 +73,11 @@ def evalua_modelo_ST_por_ventana(
             # Test va desde el indice de inicio del test hasta sumarle el test_size
             test = data.iloc[ind_test_init : ind_test_init + test_size]
 
+            ## Inicializamo y ajustamos los modelos. Realizamos las predicciones
+            # Sobre el test size
             if model_type == "ETS":
-                ## Inicializamos y ajustamos el modelo a los datos de entrenamiento
                 model = ExponentialSmoothing(train, **init_params)
                 model = model.fit(optimized=False, **fit_params)
-
-                # Predecimos los valores del test
                 predictions = model.forecast(steps=test_size)
 
             elif model_type == "prophet":
@@ -91,8 +90,13 @@ def evalua_modelo_ST_por_ventana(
                     [last_mov_avg] * fit_params["horizon"], index=test.index
                 )
 
+            elif model_type == "ARIMA":
+                model = ARIMA(train, **init_params)
+                model = model.fit()
+                predictions = model.forecast(steps=len(test))
+
             else:
-                raise ValueError("Modelo no reconocido. Use 'ETS' o 'prophet'.")
+                raise ValueError("Modelo no reconocido. Use 'ETS', 'MA', 'ARIMA' o 'prophet'.")
 
             if np.any(pd.isna(test)) or np.any(pd.isna(predictions)):
                 return float("inf")
@@ -141,6 +145,11 @@ def evalua_modelo_ST_por_ventana(
                 predictions = pd.Series(
                     [last_mov_avg] * fit_params["horizon"], index=test.index
                 )
+
+            elif model_type == "ARIMA":
+                model = ARIMA(train, **init_params)
+                model = model.fit()
+                predictions = model.forecast(steps=len(test))
 
             else:
                 raise ValueError("Modelo no reconocido. Use 'ETS' o 'prophet'.")
@@ -281,28 +290,21 @@ def optimizar_modelo_ets(
 
 
 def ajustar_modelos_arima(
-    train,
-    test,
+    df,
+    test_init,
+    test_finish,
     p_range=range(0, 10),
     d_range=range(0, 3),
     q_range=range(0, 10),
-    alpha=0.05
 ):
     """
     Ajusta modelos ARIMA(p,d,q) para p in p_range, d in d_range, q in q_range
-    (saltando el caso p=d=q=0), calcula RMSE, y testa sus residuos:
-      - Ruido blanco (Ljung-Box, lag=10)
-      - Normalidad (Jarque-Bera)
-      - Homoscedasticidad (ARCH, nlags=12)
-      - Ruido blanco en residuos² (Ljung-Box, lag=10)
+    (saltando el caso p=d=q=0), calcula RMSE.
 
     Devuelve un DataFrame con:
-      Modelo, RMSE, MAPE, p-values de cada prueba, y CumpleSupuestos (bool).
+      Modelo, RMSE.
     """
     resultados = []
-
-    def _rmse(y_true, y_pred):
-        return np.sqrt(np.mean((y_true - y_pred)**2))
 
     for p in p_range:
         for d in d_range:
@@ -310,36 +312,28 @@ def ajustar_modelos_arima(
                 if p == 0 and d == 0 and q == 0:
                     continue
                 try:
+                    init_params = {"order": (p, d, q)}
+
+                    # Ajuste y forecast
+                    warnings.filterwarnings("ignore")  # Ignorar advertencias de ARIMA
                     
-
-                    # 1) Ajuste y forecast
-                    model  = ARIMA(train, order=(p, d, q))
-                    result = model.fit()
-                    fc     = result.forecast(steps=len(test))
-                    rmse_v = _rmse(test, fc)
-
-                    # 2) Residuos
-                    resid = result.resid.dropna()[1:]  # Eliminar NaN/0 inicial
-
-                    # 3) Ljung-Box sobre resid
-                    lb_p    = acorr_ljungbox(resid, lags=[10], return_df=True)['lb_pvalue'].iloc[0]
-                    # 4) Jarque-Bera
-                    jb_stat, jb_p, skew, kurt = jarque_bera(resid)
-                    # 5) ARCH (heteroscedasticidad)
-                    arch_p  = het_arch(resid, nlags=12)[1]
-                    # 6) Ljung-Box sobre resid²
-                    lb2_p   = acorr_ljungbox(resid**2, lags=[10], return_df=True)['lb_pvalue'].iloc[0]
-
-                    cumple = all(pval > alpha for pval in (lb_p, jb_p, arch_p, lb2_p))
+                    metric = evalua_modelo_ST_por_ventana(
+                        index_name="fecha",
+                        model_type="ARIMA",
+                        init_params=init_params,
+                        fit_params={},
+                        data=df,
+                        test_init=test_init,
+                        test_finish=test_finish,
+                        window_type="rolling",
+                        train_size=12 * 5,  # 5 años
+                        test_size=1,
+                        metric="rmse"
+                    )
 
                     resultados.append({
                         "Modelo":          f"ARIMA({p},{d},{q})",
-                        "RMSE":            rmse_v,
-                        "LB10_p":          lb_p,
-                        "JB_p":            jb_p,
-                        "ARCH12_p":        arch_p,
-                        "LB2_10_p":        lb2_p,
-                        "CumpleSupuestos": cumple
+                        "RMSE":            metric,
                     })
 
                 except Exception as e:
@@ -347,7 +341,64 @@ def ajustar_modelos_arima(
                     continue
 
     df = pd.DataFrame(resultados)
-    # Ordena primero los que cumplen supuestos, luego por RMSE ascendente
-    df = df.sort_values(by=["CumpleSupuestos", "RMSE"], ascending=[False, True])
+    df = df.sort_values(by=["RMSE"], ascending=[True])
     return df.reset_index(drop=True)
 
+def validar_supuestos_df(train, results_df, model_type, alpha=0.05):
+    """
+    Valida los supuestos de un modelo ARIMA o RLM:
+    1. Residuos independientes (Ljung-Box)
+    2. Residuos normalmente distribuidos (Jarque-Bera)
+    3. Residuos homocedásticos (ARCH)
+    4. Residuos homocedásticos (Ljung-Box sobre residuos al cuadrado)
+
+    Devuelve un DataFrame con solo los modelos que cumplan los supuestos.
+    """
+    resultados = []
+
+    for index, row in results_df.iterrows():
+        if model_type == "ARIMA":
+
+            # extraer parametros y ajustar modelo ARIMA
+            order =  pd.Series(row["Modelo"]).str.extract(r'ARIMA\((\d+),(\d+),(\d+)\)').astype(int).apply(tuple,axis=1)
+            model = ARIMA(train, order = order[0])
+            model = model.fit()
+            resid = model.resid.dropna()[1:]  # Eliminar NaN/0 inicial
+
+            # Validar supuestos para ARIMA
+            lb_test = acorr_ljungbox(resid, lags=[10], return_df=True)
+            jb_test = jarque_bera(resid)
+            arch_test = het_arch(resid, nlags=12)
+            lb2_test = acorr_ljungbox(resid**2, lags=[10], return_df=True)
+
+            if (lb_test['lb_pvalue'].iloc[0] > alpha and
+                jb_test[1] > alpha and
+                arch_test[1] > alpha and
+                lb2_test['lb_pvalue'].iloc[0] > alpha):
+
+                cumple = True
+            
+            else:
+                cumple = False
+
+            resultados.append(cumple)
+
+        elif model_type == "RLM":
+
+            # Validar supuestos para RLM
+            lb_test = acorr_ljungbox(row['residuals'], lags=[10], return_df=True)
+            jb_test = jarque_bera(row['residuals'])
+            arch_test = het_arch(row['residuals'], nlags=12)
+            lb2_test = acorr_ljungbox(row['residuals']**2, lags=[10], return_df=True)
+
+            if (lb_test['lb_pvalue'].iloc[0] > 0.05 and
+                jb_test[1] > alpha and
+                arch_test[1] > alpha and
+                lb2_test['lb_pvalue'].iloc[0] > alpha):
+
+                resultados.append(row)
+
+    resultados = pd.DataFrame(resultados, columns=["CumpleSupuestos"])
+    results_df = pd.concat([results_df, resultados], axis=1)
+
+    return results_df
