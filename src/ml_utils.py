@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error, mean_absolute_error
 from typing import Dict
 from prophet import Prophet
 import optuna
@@ -578,3 +578,117 @@ def optimizar_modelo_prophet(
     print(f"Mejor resultado: {study.best_value} con parámetros: {best_params}")
 
     return study, best_params, study.best_value
+
+def metricas_ST_ventana(
+    index_name: str,
+    model_type: str,
+    init_params: dict,
+    fit_params: dict,
+    data: pd.DataFrame,
+    test_init: str,
+    test_finish: str,
+    window_type: str = "rolling",
+    train_size: int = 60,
+    test_size: int = 1,
+):
+    """
+    Evalúa un modelo de serie de tiempo usando ventana móvil o recursiva y devuelve RMSE, MAPE y R2.
+    """
+    rmse_list = []
+    mape_list = []
+    mae_list = []
+    temp_data = data.reset_index().copy()
+    ind_test_init = temp_data[temp_data[index_name] == test_init].index[0]
+
+    months = round(
+        (pd.to_datetime(test_finish) - pd.to_datetime(test_init)).days * (12 / 365)
+    )
+    total_steps = months / test_size
+
+    if total_steps % 1 != 0:
+        raise ValueError(
+            "El tamaño de la ventana no es un divisor del rango de fechas."
+        )
+    else:
+        total_steps = int(total_steps)
+
+    for step in range(total_steps):
+        # Definir train y test según la ventana
+        if window_type == "rolling":
+            train = data.iloc[ind_test_init - train_size : ind_test_init]
+        elif window_type == "expanding":
+            train = data.iloc[:ind_test_init]
+        else:
+            raise ValueError("Tipo de ventana no reconocido. Use 'rolling' o 'expanding'.")
+
+        if train.shape[0] < train_size:
+            raise ValueError(
+                "Tamaño incorrecto de ventana, estipula una ventana de menor tamaño"
+            )
+
+        test = data.iloc[ind_test_init : ind_test_init + test_size]
+
+        # Modelado según el tipo
+        if model_type == "ETS":
+            model = ExponentialSmoothing(train, **init_params)
+            model = model.fit(optimized=False, **fit_params)
+            predictions = model.forecast(steps=test_size)
+
+        elif model_type == "prophet":
+            column = train.name
+            prophet_train = train.reset_index().rename(
+                columns={index_name: "ds", column: "y"}
+            )
+            model = Prophet(**init_params)
+            model.fit(prophet_train)
+            future = model.make_future_dataframe(periods=test_size, freq='M')
+            forecast = model.predict(future)
+            predictions = pd.Series(
+                forecast['yhat'].iloc[-test_size:].values,
+                index=test.index
+            )
+
+        elif model_type == "MA":
+            mov_avg = train.rolling(window=fit_params["window_size"]).mean()
+            last_mov_avg = mov_avg.dropna().iloc[-1]
+            predictions = pd.Series(
+                [last_mov_avg] * fit_params["horizon"], index=test.index
+            )
+
+        elif model_type == "ARIMA":
+            model = ARIMA(train, **init_params)
+            model = model.fit()
+            predictions = model.forecast(steps=len(test))
+
+        elif model_type == "RLM":
+            X_train = rlm_design_x(train, **init_params)
+            y_train = train.squeeze()
+            X_test = rlm_design_x(pd.concat([train, test]), **init_params).iloc[-test_size:]
+            model = sm.OLS(y_train, X_train)
+            results = model.fit()
+            predictions = results.predict(X_test)
+
+        else:
+            raise ValueError("Modelo no reconocido. Use 'ETS', 'MA', 'ARIMA', 'RLM' o 'prophet'.")
+
+        # Validación
+        if np.any(pd.isna(test)) or np.any(pd.isna(predictions)):
+            rmse_list.append(float("inf"))
+            mape_list.append(float("inf"))
+            mae_list.append(float("-inf"))
+        else:
+            rmse_list.append(np.sqrt(mean_squared_error(test, predictions)))
+            mape_list.append(mean_absolute_percentage_error(test, predictions)*100)
+            mae_list.append(mean_absolute_error(test, predictions))
+
+        ind_test_init += test_size
+        if window_type == "expanding":
+            train_size += test_size
+
+    resultados = {
+        "rmse": np.mean(rmse_list),
+        "mape": np.mean(mape_list),
+        "mae": np.mean(mae_list),
+    }
+
+    return resultados
