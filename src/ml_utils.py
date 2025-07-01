@@ -3,7 +3,10 @@ import pandas as pd
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
 from typing import Dict
+from prophet import Prophet
 import optuna
+
+import statsmodels.api as sm
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 from statsmodels.stats.stattools import jarque_bera
@@ -81,7 +84,26 @@ def evalua_modelo_ST_por_ventana(
                 predictions = model.forecast(steps=test_size)
 
             elif model_type == "prophet":
-                pass
+                
+                # Construir dataframe para Prophet
+                prophet_train = train.reset_index().rename(
+                    columns={index_name: "ds", train.columns[-1]: "y"}
+                )
+
+                # Ajustar el modelo Prophet y generar predicciones
+                model = Prophet(
+                    yearly_seasonality=True,
+                    weekly_seasonality=False,
+                    daily_seasonality=False,
+                    seasonality_mode='additive'
+                )
+                model.fit(prophet_train)
+                future = model.make_future_dataframe(periods=test_size, freq='M')
+                forecast = model.predict(future)
+                predictions = pd.Series(
+                    forecast['yhat'].iloc[-test_size:].values,
+                    index=test.index
+                )
 
             elif model_type == "MA":
                 mov_avg = train.rolling(window=fit_params["window_size"]).mean()
@@ -94,6 +116,22 @@ def evalua_modelo_ST_por_ventana(
                 model = ARIMA(train, **init_params)
                 model = model.fit()
                 predictions = model.forecast(steps=len(test))
+
+            elif model_type == "RLM":
+                # Generamos las matrices de diseño para train y test
+                X_train = rlm_design_x(train, **init_params)
+                y_train = train.squeeze()  # para convertirlo en serie
+
+                X_test = rlm_design_x(
+                    pd.concat([train, test]), **init_params
+                ).iloc[-test_size:]
+
+                # Ajustamos el modelo
+                model = sm.OLS(y_train, X_train)
+                results = model.fit()
+
+                # Predicciones
+                predictions = results.predict(X_test)
 
             else:
                 raise ValueError("Modelo no reconocido. Use 'ETS', 'MA', 'ARIMA' o 'prophet'.")
@@ -150,6 +188,22 @@ def evalua_modelo_ST_por_ventana(
                 model = ARIMA(train, **init_params)
                 model = model.fit()
                 predictions = model.forecast(steps=len(test))
+            
+            elif model_type == "RLM":
+                # Generamos las matrices de diseño para train y test
+                X_train = rlm_design_x(train, **init_params)
+                y_train = train.squeeze()  # suponemos que es un DataFrame de una sola serie
+
+                X_test = rlm_design_x(
+                    pd.concat([train, test]), **init_params
+                ).iloc[-test_size:]
+
+                # Ajustamos el modelo
+                model = sm.OLS(y_train, X_train)
+                results = model.fit()
+
+                # Predicciones
+                predictions = results.predict(X_test)
 
             else:
                 raise ValueError("Modelo no reconocido. Use 'ETS' o 'prophet'.")
@@ -316,7 +370,7 @@ def ajustar_modelos_arima(
 
                     # Ajuste y forecast
                     warnings.filterwarnings("ignore")  # Ignorar advertencias de ARIMA
-                    
+
                     metric = evalua_modelo_ST_por_ventana(
                         index_name="fecha",
                         model_type="ARIMA",
@@ -344,6 +398,29 @@ def ajustar_modelos_arima(
     df = df.sort_values(by=["RMSE"], ascending=[True])
     return df.reset_index(drop=True)
 
+# Funcion para crear el diseño de la matriz X para un modelo RLM
+def rlm_design_x(df: pd.DataFrame, degree: int, seasonal: bool) -> pd.DataFrame:
+    """
+    Crea las X para un polinomio de grado 'degree' y opcionalmente dummies estacionales
+    """
+    X = pd.DataFrame(index=df.index)
+    
+    # Tendencia (t, t², …)
+    t = np.arange(1, len(df) + 1)
+    for d in range(1, degree + 1):
+        X[f"t^{d}"] = t ** d
+
+    # Estacionalidad con dummies (drop_first para evitar colinealidad)
+    if seasonal:
+        dums = pd.get_dummies(df.index.month, prefix="m", drop_first=True).apply(lambda x: x.astype(float), axis=0)
+        dums.index = df.index      # asegurar mismo índice
+        X = pd.concat([X, dums], axis=1)
+
+    # Constante
+    X = sm.add_constant(X)
+    return X
+
+# Funcion para validar los supuestos de un modelo ARIMA o RLM
 def validar_supuestos_df(train, results_df, model_type, alpha=0.05):
     """
     Valida los supuestos de un modelo ARIMA o RLM:
@@ -384,21 +461,109 @@ def validar_supuestos_df(train, results_df, model_type, alpha=0.05):
             resultados.append(cumple)
 
         elif model_type == "RLM":
+            
+            # extraer parametros y ajustar modelo RLM
+            degree = int(row["grado"])
+            seasonal = True
 
+            X_train = rlm_design_x(train, degree=degree, seasonal=seasonal)
+            y_train = train.squeeze()  # para convertirlo en serie
+            model = sm.OLS(y_train, X_train)
+            model = model.fit()
+            resid = model.resid.dropna()[1:]
+            
             # Validar supuestos para RLM
-            lb_test = acorr_ljungbox(row['residuals'], lags=[10], return_df=True)
-            jb_test = jarque_bera(row['residuals'])
-            arch_test = het_arch(row['residuals'], nlags=12)
-            lb2_test = acorr_ljungbox(row['residuals']**2, lags=[10], return_df=True)
+            lb_test = acorr_ljungbox(resid, lags=[10], return_df=True)
+            jb_test = jarque_bera(resid)
+            arch_test = het_arch(resid, nlags=12)
+            lb2_test = acorr_ljungbox(resid**2, lags=[10], return_df=True)
 
-            if (lb_test['lb_pvalue'].iloc[0] > 0.05 and
+            if (lb_test['lb_pvalue'].iloc[0] > alpha and
                 jb_test[1] > alpha and
                 arch_test[1] > alpha and
                 lb2_test['lb_pvalue'].iloc[0] > alpha):
 
-                resultados.append(row)
+                cumple = True
+            
+            else:
+                cumple = False
+
+            resultados.append(cumple)
 
     resultados = pd.DataFrame(resultados, columns=["CumpleSupuestos"])
     results_df = pd.concat([results_df, resultados], axis=1)
 
     return results_df
+
+
+def optimizar_modelo_prophet(
+    data,
+    test_init,
+    test_finish,
+    window_type,
+    train_size=60,
+    test_size=1,
+    metric="rmse",
+    opt_trial=100,
+):
+    """
+    Optimiza un modelo Prophet utilizando Optuna para encontrar los mejores hiperparámetros.
+
+    Parámetros:
+    - data: Serie temporal a evaluar (DataFrame).
+    - test_init: Fecha de inicio del periodo de prueba (formato 'YYYY-MM-DD').
+    - test_finish: Fecha de fin del periodo de prueba (formato 'YYYY-MM-DD').
+    - window_type: Tipo de ventana a utilizar ('rolling' o 'expanding').
+    - train_size: Tamaño de la ventana de entrenamiento (en meses).
+    - test_size: Tamaño de la ventana de prueba (en meses).
+    - metric: Métrica a utilizar para evaluar el modelo ('rmse' o 'mae').
+    - opt_trial: Número de iteraciones de Optuna para optimizar los hiperparámetros.
+    """
+
+    import optuna
+
+    def objective(trial):
+        # Definimos los hiperparámetros a optimizar
+        changepoint_prior_scale = trial.suggest_float("changepoint_prior_scale", 0.001, 0.2, log=True)
+        seasonality_prior_scale = trial.suggest_float("seasonality_prior_scale", 0.01, 5, log=True)
+        seasonality_mode = trial.suggest_categorical("seasonality_mode", ["additive", "multiplicative"])
+        n_changepoints = trial.suggest_int("n_changepoints", 1, 20)
+        yearly_seasonality = trial.suggest_int("yearly_seasonality", 2, 20)
+
+        # Construimos el diccionario de parámetros para Prophet
+        init_params = {
+            "changepoint_prior_scale": changepoint_prior_scale,
+            "seasonality_prior_scale": seasonality_prior_scale,
+            "seasonality_mode": seasonality_mode,
+            "n_changepoints": n_changepoints,
+            "yearly_seasonality": yearly_seasonality,
+            "weekly_seasonality": False, 
+            "daily_seasonality": False,
+        }
+
+        fit_params = {} 
+
+        # Evaluamos usando una ventana movil
+        window_metric = evalua_modelo_ST_por_ventana(
+            index_name="fecha",
+            model_type="prophet",
+            init_params=init_params,
+            fit_params=fit_params,
+            data=data,
+            test_init=test_init,
+            test_finish=test_finish,
+            window_type=window_type,
+            train_size=train_size,
+            test_size=test_size,
+            metric=metric,
+        )
+
+        return window_metric
+
+    # Creamos el estudio de Optuna y optimizamos la función objetivo
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=opt_trial)
+    best_params = study.best_params
+    print(f"Mejor resultado: {study.best_value} con parámetros: {best_params}")
+
+    return study, best_params, study.best_value
