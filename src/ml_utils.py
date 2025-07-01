@@ -84,19 +84,15 @@ def evalua_modelo_ST_por_ventana(
                 predictions = model.forecast(steps=test_size)
 
             elif model_type == "prophet":
-                
+
                 # Construir dataframe para Prophet
+                column = train.name
                 prophet_train = train.reset_index().rename(
-                    columns={index_name: "ds", train.columns[-1]: "y"}
+                    columns={index_name: "ds", column: "y"}
                 )
 
                 # Ajustar el modelo Prophet y generar predicciones
-                model = Prophet(
-                    yearly_seasonality=True,
-                    weekly_seasonality=False,
-                    daily_seasonality=False,
-                    seasonality_mode='additive'
-                )
+                model = Prophet(**init_params)
                 model.fit(prophet_train)
                 future = model.make_future_dataframe(periods=test_size, freq='M')
                 forecast = model.predict(future)
@@ -175,7 +171,22 @@ def evalua_modelo_ST_por_ventana(
                 predictions = model.forecast(steps=test_size)
 
             elif model_type == "prophet":
-                pass
+
+                # Construir dataframe para Prophet
+                column = train.name
+                prophet_train = train.reset_index().rename(
+                    columns={index_name: "ds", column: "y"}
+                )
+
+                # Ajustar el modelo Prophet y generar predicciones
+                model = Prophet(**init_params)
+                model.fit(prophet_train)
+                future = model.make_future_dataframe(periods=test_size, freq='M')
+                forecast = model.predict(future)
+                predictions = pd.Series(
+                    forecast['yhat'].iloc[-test_size:].values,
+                    index=test.index
+                )
             
             elif model_type == "MA":
                 mov_avg = train.rolling(window=fit_params["window_size"]).mean()
